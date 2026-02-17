@@ -1,0 +1,891 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Energy EDGE · Costes</title>
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      margin: 20px;
+    }
+
+    /* Evita saltos cuando aparece/desaparece la scrollbar */
+    html { overflow-y: scroll; }
+
+    .row {
+      display:flex;
+      gap:16px;
+      flex-wrap:wrap;
+      align-items:stretch;
+    }
+
+    .card {
+      border:1px solid #e5e7eb;
+      border-radius:14px;
+      padding:14px;
+      flex:1;
+      min-width:360px;
+      background:#fff;
+    }
+
+    .muted {
+      color:#6b7280;
+      font-size:12px;
+    }
+
+    .warn {
+      color:#b45309;
+      font-size:12px;
+      margin-top:6px;
+    }
+
+    .hr {
+      border-top:1px solid #e5e7eb;
+      margin:12px 0;
+    }
+
+    label {
+      font-size:12px;
+      color:#374151;
+      display:block;
+    }
+
+    input, select {
+      padding:6px 8px;
+      border:1px solid #d1d5db;
+      border-radius:10px;
+      background:#fff;
+    }
+
+    .btn {
+      padding:8px 10px;
+      border:1px solid #d1d5db;
+      border-radius:12px;
+      background:#fff;
+      cursor:pointer;
+    }
+
+    .btn:hover { background:#f3f4f6; }
+
+    .digit{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      padding:10px 12px;
+      background:#0b1020;
+      color:#e5e7eb;
+      border-radius:10px;
+      display:block;
+      width:100%;
+      min-width:0;
+      box-sizing:border-box;
+      text-align:right;
+    }
+
+    .grid2 {
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:12px;
+      align-items:start;
+    }
+
+    .grid  {
+      display:grid;
+      grid-template-columns: repeat(3, minmax(180px, 1fr));
+      gap:10px;
+    }
+
+    .kv{
+      display:grid;
+      grid-template-columns: 48px 1fr;
+      gap:10px;
+      align-items:center;
+      margin:10px 0;
+    }
+
+    .kv .k{
+      font-size:12px;
+      color:#374151;
+    }
+
+    .kvTotal{
+      display:grid;
+      grid-template-columns: 130px 1fr;
+      gap:10px;
+      align-items:center;
+      margin:10px 0;
+    }
+
+    .kvTotal .k{
+      font-size:12px;
+      color:#6b7280;
+    }
+
+    .headerLine {
+      display:flex;
+      gap:12px;
+      flex-wrap:wrap;
+      align-items:end;
+    }
+
+    .spacer { flex:1; }
+
+    .pill {
+      display:inline-block;
+      padding:2px 8px;
+      border:1px solid #e5e7eb;
+      border-radius:999px;
+      font-size:12px;
+      color:#374151;
+      background:#fff;
+    }
+
+    /* ===== SOLUCIÓN AL DESPLAZAMIENTO (status) ===== */
+    #status{
+      flex: 0 0 220px;      /* ancho reservado fijo */
+      min-width: 220px;
+      text-align: right;
+      white-space: nowrap;  /* evita salto de línea */
+    }
+
+    #chart_status{
+      min-width: 200px;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .brandbar{
+      display:flex;
+      align-items:center;
+      gap:18px;
+      margin-bottom:14px;
+    }
+
+    .brandbar img{
+      height:90px;
+      width:auto;
+      display:block;
+    }
+
+    .brandbar .title{
+      margin:0;
+      line-height:1.1;
+    }
+
+
+
+
+
+    /* Reservar altura para textos dinámicos */
+    #rangeTxt{ min-height: 16px; }
+    #tariffWarn{ min-height: 16px; }
+
+    /* Canvas */
+    #chart_canvas { width: 100%; }
+  </style>
+
+  <!-- Chart.js + date adapter (para eje temporal) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/date-fns@3.6.0/index.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+</head>
+
+<body>
+  <div class="brandbar">
+    <img src="/static/logo.png" alt="Logo empresa">
+    <h1 class="title">Energy EDGE · Consumos y Costes</h1>
+  </div>
+
+
+  <!-- CONTROLES -->
+  <div class="card">
+    <div class="headerLine">
+
+      <div>
+        <label>meter_id</label>
+        <select id="meterSel" style="width:320px"></select>
+        <div class="muted" style="margin-top:4px">Seleccionado: <span class="pill" id="meterTxt">--</span></div>
+      </div>
+
+      <div>
+        <label>custom meter_id (opcional)</label>
+        <input id="meterCustom" placeholder="(deja vacío si usas selector)" style="width:320px"/>
+        <div class="muted" style="margin-top:4px">Si rellenas esto, tiene prioridad.</div>
+      </div>
+
+      <div>
+        <label>channel</label>
+        <select id="channel" style="width:120px">
+          <option value="T">T</option>
+          <option value="L1">L1</option>
+          <option value="L2">L2</option>
+          <option value="L3">L3</option>
+        </select>
+      </div>
+
+      <div>
+        <label>periodo consumos</label>
+        <select id="period" style="width:160px">
+          <option value="day">Hoy</option>
+          <option value="month">Mes</option>
+        </select>
+      </div>
+
+      <div>
+        <label>Mes (tarifas)</label>
+        <input id="ym" type="month" style="width:170px"/>
+        <div class="muted" style="margin-top:4px">Tarifa: <span class="pill" id="ymTxt">--</span></div>
+      </div>
+
+      <div>
+        <label>tz</label>
+        <input id="tz" value="Europe/Bucharest" style="width:220px"/>
+      </div>
+
+      <div>
+        <label>refresh (s)</label>
+        <input id="refresh" type="number" value="20" min="3" max="300" style="width:110px"/>
+      </div>
+
+      <button class="btn" id="saveBtn">Guardar precios</button>
+
+      <div class="spacer"></div>
+      <div class="muted" id="status"></div>
+    </div>
+
+    <div class="muted" id="rangeTxt" style="margin-top:8px;">--</div>
+    <div class="warn" id="tariffWarn" style="display:none;"></div>
+  </div>
+
+  <!-- 2 columnas: Consumos / Precios -->
+  <div class="row" style="margin-top:16px;">
+    <!-- CONSUMOS -->
+    <div class="card">
+      <h3>Consumos</h3>
+
+      <div class="kvTotal">
+        <div class="k">Activa consumida (kWh)</div>
+        <span class="digit" id="kwh_imp">--</span>
+      </div>
+
+      <div class="kvTotal">
+        <div class="k">Activa producida (kWh)</div>
+        <span class="digit" id="kwh_exp">--</span>
+      </div>
+
+      <div class="grid2">
+        <div>
+          <div class="muted">Reactiva inductiva (kvarh)</div>
+          <div class="kv"><div class="k">X1</div><span class="digit" id="ind1">--</span></div>
+          <div class="kv"><div class="k">X2</div><span class="digit" id="ind2">--</span></div>
+          <div class="kv"><div class="k">X3</div><span class="digit" id="ind3">--</span></div>
+          <div class="kvTotal">
+            <div class="k">Total ind</div>
+            <span class="digit" id="indT">--</span>
+          </div>
+        </div>
+
+        <div>
+          <div class="muted">Reactiva capacitiva (kvarh)</div>
+          <div class="kv"><div class="k">X1</div><span class="digit" id="cap1">--</span></div>
+          <div class="kv"><div class="k">X2</div><span class="digit" id="cap2">--</span></div>
+          <div class="kv"><div class="k">X3</div><span class="digit" id="cap3">--</span></div>
+          <div class="kvTotal">
+            <div class="k">Total cap</div>
+            <span class="digit" id="capT">--</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+
+      <h4 style="margin:0 0 8px 0;">Costes</h4>
+      <div class="muted" style="margin-bottom:8px;">
+        Calculado con el consumo del periodo y los precios del panel “Precios”.
+      </div>
+
+      <div class="kvTotal">
+        <div class="k">Coste activa</div>
+        <span class="digit" id="c_active">--</span>
+      </div>
+
+      <div class="kvTotal">
+        <div class="k">Coste reactiva inductiva</div>
+        <span class="digit" id="c_ind">--</span>
+      </div>
+
+      <div class="kvTotal">
+        <div class="k">Coste reactiva capacitiva</div>
+        <span class="digit" id="c_cap">--</span>
+      </div>
+
+      <div class="kvTotal">
+        <div class="k"><b>Total</b></div>
+        <span class="digit" id="c_total">--</span>
+      </div>
+    </div>
+
+    <!-- PRECIOS -->
+    <div class="card">
+      <h3>Precios</h3>
+      <div class="muted">Se guardan por <b>meter_id + channel + mes (YYYY-MM)</b>.</div>
+
+      <div class="hr"></div>
+
+      <div>
+        <label>Moneda</label>
+        <input id="cur" value="RON" style="width:120px"/>
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="muted">Activa</div>
+      <div class="grid">
+        <div>
+          <label>Precio activa (por kWh)</label>
+          <input id="p_active" type="number" step="0.001" value="0.000"/>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="muted">Reactiva inductiva (por kvarh)</div>
+      <div class="grid">
+        <div><label>X1</label><input id="p_ind1" type="number" step="0.001" value="0.000"></div>
+        <div><label>X2</label><input id="p_ind2" type="number" step="0.001" value="0.000"></div>
+        <div><label>X3</label><input id="p_ind3" type="number" step="0.001" value="0.000"></div>
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="muted">Reactiva capacitiva (por kvarh)</div>
+      <div class="grid">
+        <div><label>X1</label><input id="p_cap1" type="number" step="0.001" value="0.000"></div>
+        <div><label>X2</label><input id="p_cap2" type="number" step="0.001" value="0.000"></div>
+        <div><label>X3</label><input id="p_cap3" type="number" step="0.001" value="0.000"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- INSTANTÁNEO -->
+  <div class="row" style="margin-top:16px;">
+    <div class="card">
+      <h3>Instantáneo</h3>
+      <div class="grid2">
+        <div>
+          <div class="kvTotal"><div class="k">Tensión (V)</div><span class="digit" id="inst_v">--</span></div>
+          <div class="kvTotal"><div class="k">Corriente (A)</div><span class="digit" id="inst_i">--</span></div>
+          <div class="kvTotal"><div class="k">cos φ</div><span class="digit" id="inst_pf">--</span></div>
+        </div>
+        <div>
+          <div class="kvTotal"><div class="k">P activa (W)</div><span class="digit" id="inst_p">--</span></div>
+          <div class="kvTotal"><div class="k">Q reactiva (var)</div><span class="digit" id="inst_q">--</span></div>
+          <div class="muted" id="inst_ts" style="margin-top:8px;">--</div>
+        </div>
+      </div>
+      <div class="muted">*P y cos φ vienen del smartmeter. Q la calcula el backend si no viene directa.</div>
+    </div>
+  </div>
+
+  <!-- GRÁFICO -->
+  <div class="row" style="margin-top:16px;">
+    <div class="card">
+      <h3>Gráfico</h3>
+
+      <div class="headerLine" style="align-items:end;">
+        <div>
+          <label>Métrica</label>
+          <select id="chart_metric" style="width:220px">
+            <option value="voltage_v">Voltaje (V)</option>
+            <option value="current_a">Intensidad (A)</option>
+            <option value="power_factor">cos φ</option>
+            <option value="energy_active_kwh">Energía activa (kWh)</option>
+            <option value="energy_reactive_kvarh">Energía reactiva (kvarh)</option>
+          </select>
+        </div>
+
+        <div>
+          <label>Fase</label>
+          <select id="chart_channel" style="width:140px">
+            <option value="T">Total (T)</option>
+            <option value="L1">L1</option>
+            <option value="L2">L2</option>
+            <option value="L3">L3</option>
+          </select>
+        </div>
+
+        <div>
+          <label>Inicio</label>
+          <input id="chart_start" type="datetime-local" style="width:220px">
+        </div>
+
+        <div>
+          <label>Fin</label>
+          <input id="chart_end" type="datetime-local" style="width:220px">
+        </div>
+
+        <div>
+          <label>Resolución</label>
+          <select id="chart_step" style="width:160px">
+            <option value="60">1 min</option>
+            <option value="300">5 min</option>
+            <option value="900">15 min</option>
+            <option value="3600">1 h</option>
+          </select>
+        </div>
+
+        <button class="btn" id="chart_load">Cargar</button>
+        <button class="btn" id="chart_today">Hoy (24h)</button>
+
+        <div class="spacer"></div>
+        <div class="muted" id="chart_status">--</div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <canvas id="chart_canvas" height="110"></canvas>
+      </div>
+
+      <div class="muted" style="margin-top:8px;">
+        Por defecto: día en curso (00:00 → ahora) en tu zona horaria (tz).
+      </div>
+    </div>
+  </div>
+
+<script>
+const TOKEN = new URLSearchParams(window.location.search).get("token") || "";
+const URL_METER = new URLSearchParams(window.location.search).get("meter_id") || "";
+const URL_YM = new URLSearchParams(window.location.search).get("ym") || "";
+
+function currentYm() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
+function ymValue() {
+  const v = (document.getElementById("ym").value || "").trim();
+  return v || currentYm();
+}
+
+function fmt(x, dec=3) {
+  if (x === null || x === undefined || Number.isNaN(x)) return "--";
+  const n = Number(x);
+  if (!Number.isFinite(n)) return "--";
+  return n.toFixed(dec);
+}
+function num(id) {
+  const v = parseFloat(document.getElementById(id).value);
+  return Number.isFinite(v) ? v : 0;
+}
+function setTariffWarn(msg) {
+  const el = document.getElementById("tariffWarn");
+  if (!msg) { el.style.display = "none"; el.textContent = ""; return; }
+  el.style.display = "block";
+  el.textContent = msg;
+}
+
+async function fetchJson(url, opts) {
+  const sep = url.includes("?") ? "&" : "?";
+  const withToken = TOKEN ? (url + sep + "token=" + encodeURIComponent(TOKEN)) : url;
+  const r = await fetch(withToken, opts || {});
+  if (!r.ok) {
+    const t = await r.text().catch(()=> "");
+    throw new Error(`HTTP ${r.status} en ${url} ${t ? ("· " + t.slice(0,120)) : ""}`);
+  }
+  return await r.json();
+}
+
+function getMeterId() {
+  const custom = (document.getElementById("meterCustom").value || "").trim();
+  const sel = (document.getElementById("meterSel").value || "").trim();
+  const m = custom || sel;
+  document.getElementById("meterTxt").textContent = m || "--";
+  localStorage.setItem("energy_meter_id", m || "");
+  return m;
+}
+
+function pickChannel(rows, c) {
+  return (rows || []).find(x => x.channel === c) || null;
+}
+
+async function loadMeters() {
+  const sel = document.getElementById("meterSel");
+  sel.innerHTML = "";
+  const meters = await fetchJson("/api/meters");
+  (meters || []).forEach(m => {
+    const o = document.createElement("option");
+    o.value = m;
+    o.textContent = m;
+    sel.appendChild(o);
+  });
+
+  // prioridad: URL ?meter_id, luego localStorage, luego primero
+  const saved = localStorage.getItem("energy_meter_id") || "";
+  const want = URL_METER || saved || (meters && meters[0]) || "";
+  if (want) sel.value = want;
+  document.getElementById("meterTxt").textContent = want || "--";
+}
+
+async function loadTariffs() {
+  const m = getMeterId();
+  const c = document.getElementById("channel").value.trim();
+  const ym = ymValue();
+  document.getElementById("ymTxt").textContent = ym;
+
+  const t = await fetchJson(`/api/tariffs?meter_id=${encodeURIComponent(m)}&channel=${encodeURIComponent(c)}&ym=${encodeURIComponent(ym)}`);
+  setTariffWarn("");
+
+  document.getElementById("cur").value = t.currency || "RON";
+  document.getElementById("p_active").value = t.price_active_kwh ?? 0;
+
+  document.getElementById("p_ind1").value = t.price_ind_x1 ?? 0;
+  document.getElementById("p_ind2").value = t.price_ind_x2 ?? 0;
+  document.getElementById("p_ind3").value = t.price_ind_x3 ?? 0;
+
+  document.getElementById("p_cap1").value = t.price_cap_x1 ?? 0;
+  document.getElementById("p_cap2").value = t.price_cap_x2 ?? 0;
+  document.getElementById("p_cap3").value = t.price_cap_x3 ?? 0;
+}
+
+async function saveTariffs() {
+  const m = getMeterId();
+  const c = document.getElementById("channel").value.trim();
+  const ym = ymValue();
+  document.getElementById("ymTxt").textContent = ym;
+
+  const payload = {
+    currency: document.getElementById("cur").value.trim() || "RON",
+    price_active_kwh: num("p_active"),
+    price_ind_x1: num("p_ind1"),
+    price_ind_x2: num("p_ind2"),
+    price_ind_x3: num("p_ind3"),
+    price_cap_x1: num("p_cap1"),
+    price_cap_x2: num("p_cap2"),
+    price_cap_x3: num("p_cap3"),
+  };
+
+  await fetchJson(`/api/tariffs?meter_id=${encodeURIComponent(m)}&channel=${encodeURIComponent(c)}&ym=${encodeURIComponent(ym)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+function setTxt(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
+function computeCosts(kwh, ind, cap) {
+  const curEl = document.getElementById("cur");
+  const cur = curEl ? (curEl.value.trim() || "RON") : "RON";
+
+  const c_active = kwh * num("p_active");
+  const c_ind = (ind.X1||0)*num("p_ind1") + (ind.X2||0)*num("p_ind2") + (ind.X3||0)*num("p_ind3");
+  const c_cap = (cap.X1||0)*num("p_cap1") + (cap.X2||0)*num("p_cap2") + (cap.X3||0)*num("p_cap3");
+  const total = c_active + c_ind + c_cap;
+
+  setTxt("c_active", fmt(c_active, 3) + " " + cur);
+  setTxt("c_ind", fmt(c_ind, 3) + " " + cur);
+  setTxt("c_cap", fmt(c_cap, 3) + " " + cur);
+  setTxt("c_total", fmt(total, 3) + " " + cur);
+}
+
+async function refreshInstant() {
+  const m = getMeterId();
+  const c = document.getElementById("channel").value.trim();
+
+  const r = await fetchJson(`/api/latest_instant?meter_id=${encodeURIComponent(m)}&channel=${encodeURIComponent(c)}`);
+  const d = (r && r.data) ? r.data : {};
+
+  document.getElementById("inst_v").textContent  = fmt(d.voltage_v, 2);
+  document.getElementById("inst_i").textContent  = fmt(d.current_a, 3);
+  document.getElementById("inst_pf").textContent = fmt(d.power_factor, 3);
+  document.getElementById("inst_p").textContent  = fmt(d.active_power_w, 1);
+  document.getElementById("inst_q").textContent  = fmt(d.reactive_power_var, 1);
+
+  const tsTxt = r.ts ? new Date(r.ts * 1000).toLocaleString() : "--";
+  document.getElementById("inst_ts").textContent = `ts: ${tsTxt}`;
+}
+
+async function refreshAll() {
+  const m = getMeterId();
+  const c = document.getElementById("channel").value.trim();
+  const period = document.getElementById("period").value;
+  const tz = document.getElementById("tz").value.trim() || "Europe/Bucharest";
+
+  document.getElementById("status").textContent = "Actualizando · " + new Date().toLocaleTimeString();
+
+  const totals = await fetchJson(`/api/totals_interval?meter_id=${encodeURIComponent(m)}&period=${encodeURIComponent(period)}&tz=${encodeURIComponent(tz)}`);
+  const r = pickChannel(totals.rows, c);
+
+  const kwh_imp = r ? (r.kwh_import || 0) : 0;
+  const kwh_exp = r ? (r.kwh_export || 0) : 0;
+  const ind = r ? (r.kvarh_ind || {X1:0,X2:0,X3:0}) : {X1:0,X2:0,X3:0};
+  const cap = r ? (r.kvarh_cap || {X1:0,X2:0,X3:0}) : {X1:0,X2:0,X3:0};
+
+  document.getElementById("kwh_imp").textContent = fmt(kwh_imp, 3);
+  document.getElementById("kwh_exp").textContent = fmt(kwh_exp, 3);
+
+  document.getElementById("ind1").textContent = fmt(ind.X1||0, 3);
+  document.getElementById("ind2").textContent = fmt(ind.X2||0, 3);
+  document.getElementById("ind3").textContent = fmt(ind.X3||0, 3);
+  document.getElementById("indT").textContent = fmt((ind.X1||0)+(ind.X2||0)+(ind.X3||0), 3);
+
+  document.getElementById("cap1").textContent = fmt(cap.X1||0, 3);
+  document.getElementById("cap2").textContent = fmt(cap.X2||0, 3);
+  document.getElementById("cap3").textContent = fmt(cap.X3||0, 3);
+  document.getElementById("capT").textContent = fmt((cap.X1||0)+(cap.X2||0)+(cap.X3||0), 3);
+
+  const fromTxt = totals.start_ts ? new Date(totals.start_ts*1000).toLocaleString() : "--";
+  const toTxt = totals.end_ts ? new Date(totals.end_ts*1000).toLocaleString() : "--";
+  document.getElementById("rangeTxt").textContent = `Rango: ${fromTxt} → ${toTxt} · tz=${tz}`;
+
+  computeCosts(kwh_imp, ind, cap);
+  await refreshInstant();
+
+  document.getElementById("status").textContent = "OK · " + new Date().toLocaleTimeString();
+}
+
+let timer = null;
+function restartTimer() {
+  if (timer) clearInterval(timer);
+  const r = parseInt(document.getElementById("refresh").value, 10) || 20;
+  timer = setInterval(() => refreshAll().catch(err => {
+    console.error(err);
+    document.getElementById("status").textContent = "ERROR · " + err.message;
+  }), r*1000);
+}
+
+/* =========================
+   CHART
+   ========================= */
+let chartObj = null;
+
+function pad2(n){ return String(n).padStart(2,"0"); }
+function toLocalInputValue(d){
+  const yyyy = d.getFullYear();
+  const mm = pad2(d.getMonth()+1);
+  const dd = pad2(d.getDate());
+  const hh = pad2(d.getHours());
+  const mi = pad2(d.getMinutes());
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+}
+function setDefaultTodayRange(){
+  const now = new Date();
+  const start = new Date(now);
+  start.setHours(0,0,0,0);
+
+  document.getElementById("chart_start").value = toLocalInputValue(start);
+  document.getElementById("chart_end").value = toLocalInputValue(now);
+
+  // resolución razonable para 24h
+  document.getElementById("chart_step").value = "300"; // 5 min
+}
+function parseLocalInputToTsSeconds(id){
+  const v = (document.getElementById(id).value || "").trim();
+  if (!v) return null;
+  const d = new Date(v); // local
+  const ts = Math.floor(d.getTime()/1000);
+  return Number.isFinite(ts) ? ts : null;
+}
+function metricLabel(metric){
+  switch(metric){
+    case "voltage_v": return "Voltaje (V)";
+    case "current_a": return "Intensidad (A)";
+    case "power_factor": return "cos φ";
+    case "energy_active_kwh": return "Energía activa (kWh)";
+    case "energy_reactive_kvarh": return "Energía reactiva (kvarh)";
+    default: return metric;
+  }
+}
+function metricDec(metric){
+  switch(metric){
+    case "voltage_v": return 2;
+    case "current_a": return 3;
+    case "power_factor": return 3;
+    case "energy_active_kwh": return 3;
+    case "energy_reactive_kvarh": return 3;
+    default: return 3;
+  }
+}
+
+async function loadSeriesAndPlot(){
+  const m = getMeterId();
+  const metric = document.getElementById("chart_metric").value;
+  const ch = document.getElementById("chart_channel").value;
+  const tz = (document.getElementById("tz").value || "Europe/Bucharest").trim();
+
+  const start_ts = parseLocalInputToTsSeconds("chart_start");
+  const end_ts = parseLocalInputToTsSeconds("chart_end");
+  const step_s = parseInt(document.getElementById("chart_step").value, 10) || 300;
+
+  if (!start_ts || !end_ts || end_ts <= start_ts) {
+    document.getElementById("chart_status").textContent = "Rango inválido";
+    return;
+  }
+
+  document.getElementById("chart_status").textContent = "Cargando…";
+
+  const url =
+    `/api/series?meter_id=${encodeURIComponent(m)}` +
+    `&metric=${encodeURIComponent(metric)}` +
+    `&channel=${encodeURIComponent(ch)}` +
+    `&start_ts=${encodeURIComponent(start_ts)}` +
+    `&end_ts=${encodeURIComponent(end_ts)}` +
+    `&step_s=${encodeURIComponent(step_s)}` +
+    `&tz=${encodeURIComponent(tz)}`;
+
+  const r = await fetchJson(url);
+  const points = (r && r.points) ? r.points : [];
+
+  // Construimos puntos {x,y} (x en ms) -> ideal para scale time
+  const series = [];
+  for (const p of points) {
+    const x = p.ts * 1000;           // ms
+    const y = Number(p.v);
+    series.push({ x, y: Number.isFinite(y) ? y : null });
+  }
+
+  // Debug rápido: min/max para ver si realmente hay valores
+  let min = Infinity, max = -Infinity, nOk = 0;
+  for (const pt of series) {
+    if (pt.y === null) continue;
+    nOk++;
+    if (pt.y < min) min = pt.y;
+    if (pt.y > max) max = pt.y;
+  }
+
+  const ctx = document.getElementById("chart_canvas").getContext("2d");
+  const label = `${metricLabel(metric)} · ${ch}`;
+
+  if (chartObj) chartObj.destroy();
+
+  chartObj = new Chart(ctx, {
+    type: "line",
+    data: {
+      datasets: [{
+        label,
+        data: series,     // <-- puntos {x,y}
+        pointRadius: 0,
+        borderWidth: 2,
+        tension: 0.2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: {
+          type: "time",
+          time: { unit: "hour" }
+        },
+        y: {
+          ticks: {
+            callback: (v) => {
+              const dec = metricDec(metric);
+              const n = Number(v);
+              return Number.isFinite(n) ? n.toFixed(dec) : v;
+            }
+          }
+        }
+      },
+      plugins: {
+        legend: { display: true }
+      }
+    }
+  });
+
+  document.getElementById("chart_status").textContent =
+    `OK · ${points.length} puntos (${nOk} válidos) · min=${Number.isFinite(min)?min.toFixed(3):"--"} · max=${Number.isFinite(max)?max.toFixed(3):"--"} · step=${step_s}s`;
+}
+
+/* =========================
+   EVENTS
+   ========================= */
+document.getElementById("saveBtn").addEventListener("click", async () => {
+  try {
+    await saveTariffs();
+    await loadTariffs();
+    await refreshAll();
+    document.getElementById("status").textContent = "Precios guardados · " + new Date().toLocaleTimeString();
+  } catch (e) {
+    console.error(e);
+    document.getElementById("status").textContent = "ERROR guardando · " + e.message;
+  }
+});
+
+["meterSel","meterCustom","channel","period","tz","refresh","ym"].forEach(id => {
+  document.getElementById(id).addEventListener("change", async () => {
+    try {
+      await loadTariffs();
+    } catch (e) {
+      setTariffWarn("Aviso: no se pudieron cargar tarifas para ese mes/meter/channel (mira el status).");
+    }
+    await refreshAll().catch(console.error);
+    restartTimer();
+
+    // opcional: sincroniza fase del gráfico con el selector principal
+    document.getElementById("chart_channel").value = document.getElementById("channel").value;
+    loadSeriesAndPlot().catch(console.error);
+  });
+});
+
+document.getElementById("chart_load").addEventListener("click", () => {
+  loadSeriesAndPlot().catch(e => {
+    console.error(e);
+    document.getElementById("chart_status").textContent = "ERROR · " + e.message;
+  });
+});
+
+document.getElementById("chart_today").addEventListener("click", () => {
+  setDefaultTodayRange();
+  loadSeriesAndPlot().catch(e => {
+    console.error(e);
+    document.getElementById("chart_status").textContent = "ERROR · " + e.message;
+  });
+});
+
+["chart_metric","chart_channel","chart_step"].forEach(id => {
+  document.getElementById(id).addEventListener("change", () => {
+    loadSeriesAndPlot().catch(console.error);
+  });
+});
+
+(async () => {
+  document.getElementById("ym").value = URL_YM || currentYm();
+  document.getElementById("ymTxt").textContent = ymValue();
+
+  try {
+    await loadMeters();
+  } catch (e) {
+    document.getElementById("status").textContent = "ERROR · no se pudo cargar /api/meters · " + e.message;
+    // dejamos selector vacío, pero podrás usar custom
+  }
+
+  try {
+    await loadTariffs();
+  } catch (e) {
+    setTariffWarn("Aviso: no se pudieron cargar tarifas. (¿backend actualizado con /api/tariffs?)");
+  }
+
+  // Set defaults for chart
+  setDefaultTodayRange();
+  document.getElementById("chart_channel").value = document.getElementById("channel").value;
+
+  await refreshAll().catch(err => {
+    console.error(err);
+    document.getElementById("status").textContent = "ERROR · " + err.message;
+  });
+
+  // Carga primer gráfico (si /api/series existe)
+  loadSeriesAndPlot().catch(err => {
+    console.error(err);
+    document.getElementById("chart_status").textContent = "Aviso: /api/series no disponible o sin datos.";
+  });
+
+  restartTimer();
+})();
+</script>
+</body>
+</html>

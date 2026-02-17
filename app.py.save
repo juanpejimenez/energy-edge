@@ -1,0 +1,536 @@
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Depends
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+from typing import Dict, Any, Optional, List
+from sqlalchemy import create_engine, text
+import os
+import time
+import json
+import traceback
+import math
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI(title="Energy API", version="0.1.0")
+
+# =========================
+# CONFIG
+# =========================
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set")
+
+# Token opcional (si no está, no valida)
+API_TOKEN = (os.getenv("ENERGY_API_TOKEN") or os.getenv("ENERGY_API_KEY") or "").strip()
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+# =========================
+# MODELS
+# =========================
+
+class ChannelPayload(BaseModel):
+    # Intervalos (deltas / energía acumulada por intervalo)
+    kwh_import: Optional[float] = 0.0
+    kwh_export: Optional[float] = 0.0
+    kvarh_ind: Optional[Dict[str, float]] = Field(default_factory=dict)  # {"X1":..., "X2":..., "X3":...}
+    kvarh_cap: Optional[Dict[str, float]] = Field(default_factory=dict)
+
+    # Instantáneos (todo lo que mande el smartmeter, sin procesar)
+    instant: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+    class Config:
+        extra = "allow"
+
+
+class Payload(BaseModel):
+    device_id: str
+    ts_from: int
+    ts_to: int
+    channels: Dict[str, ChannelPayload]
+
+# =========================
+# DB INIT (CREATE TABLES)
+# =========================
+
+@app.on_event("startup")
+def startup_init():
+    """
+    Crea la tabla telemetry_instants si no existe.
+    NO toca tu tabla telemetry_intervals existente.
+    """
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS meters (
+                id TEXT PRIMARY KEY,
+                model TEXT,
+                wiring TEXT,
+                measurement_mode TEXT,
+                is_enabled BOOLEAN NOT NULL DEFAULT TRUE
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS telemetry_instants (
+                id BIGSERIAL PRIMARY KEY,
+                meter_id TEXT NOT NULL REFERENCES meters(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                data JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (meter_id, channel, ts)
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_telemetry_instants_meter_ts
+            ON telemetry_instants (meter_id, ts DESC);
+        """))
+
+# =========================
+# AUTH HELPERS
+# =========================
+
+def _auth_ok(
+    authorization: Optional[str],
+    x_api_key: Optional[str],
+    token_qs: Optional[str] = None,
+) -> bool:
+    """
+"/dashboard"    Si API_TOKEN está vacío => no valida (modo abierto).
+
+    Si está definido, acepta:
+      - Header: X-API-Key: <TOKEN>
+      - Header: Authorization: Bearer <TOKEN>
+      - Query:  ?token=<TOKEN>   (útil para /health detrás de nginx)
+    """
+    if not API_TOKEN:
+        return True
+
+    if x_api_key and x_api_key.strip() == API_TOKEN:
+        return True
+
+    if authorization and authorization.strip() == f"Bearer {API_TOKEN}":
+        return True
+
+    if token_qs and token_qs.strip() == API_TOKEN:
+        return True
+
+    return False
+
+
+def require_key(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    token_qs = request.query_params.get("token")
+    if not _auth_ok(authorization, x_api_key, token_qs):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+# =========================
+# HELPERS
+# =========================
+
+def _to_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _sanitize_jsonable(obj: Any) -> Any:
+    """
+    Convierte valores a algo JSON serializable sin petar:
+    - floats/ints/str/bool/None ok
+    - dict/list recursivo
+    - otros => str(obj)
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, list):
+        return [_sanitize_jsonable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_jsonable(v) for k, v in obj.items()}
+    return str(obj)
+
+
+def _compute_kvar_from_p_pf(p_w: Any, pf: Any) -> float:
+    """
+    Q (var) = P (W) * tan(acos(pf))
+    pf se clamp a [-1, 1]. Si pf ~ 0 => 0 para evitar infinito.
+    """
+    try:
+        p = float(p_w) if p_w is not None else 0.0
+        pfv = float(pf) if pf is not None else 0.0
+        if not math.isfinite(p) or not math.isfinite(pfv):
+            return 0.0
+        pfv = max(-1.0, min(1.0, pfv))
+        if abs(pfv) < 1e-6:
+            return 0.0
+        phi = math.acos(pfv)
+        q = p * math.tan(phi)
+        if not math.isfinite(q):
+            return 0.0
+        return q
+    except Exception:
+        return 0.0
+
+
+def _period_bounds_utc(period: str) -> tuple[int, int]:
+    """
+    Devuelve (start_ts, end_ts) para 'day' o 'month' en UTC.
+    """
+    now = datetime.now(timezone.utc)
+    if period == "day":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+    elif period == "month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+    else:
+        raise ValueError("period must be 'day' or 'month'")
+    return int(start.timestamp()), int(end.timestamp())
+
+# =========================
+# BASIC ROUTES
+# =========================
+
+@app.get("/")
+def read_root():
+    return {"status": "ok", "service": "energy-api"}
+
+@app.get("/health", dependencies=[Depends(require_key)])
+def health():
+    return {"status": "ok"}
+
+# =========================
+# INGEST
+# =========================
+
+@app.post("/api/energy", dependencies=[Depends(require_key)])
+async def ingest(payload: Payload):
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO meters (id, model, wiring, measurement_mode, is_enabled)
+                    VALUES (:id, :model, :wiring, :mode, TRUE)
+                    ON CONFLICT (id) DO NOTHING
+                """),
+                {"id": payload.device_id, "model": "unknown", "wiring": "unknown", "mode": "unknown"}
+            )
+
+            for channel, v in payload.channels.items():
+                if v is None:
+                    v = ChannelPayload()
+
+                # ---------- intervalos ----------
+                kwh_import = _to_float(v.kwh_import, 0.0)
+                kwh_export = _to_float(v.kwh_export, 0.0)
+
+                kvarh_ind = v.kvarh_ind or {}
+                i1 = _to_float(kvarh_ind.get("X1"), 0.0)
+                i2 = _to_float(kvarh_ind.get("X2"), 0.0)
+                i3 = _to_float(kvarh_ind.get("X3"), 0.0)
+
+                kvarh_cap = v.kvarh_cap or {}
+                c1 = _to_float(kvarh_cap.get("X1"), 0.0)
+                c2 = _to_float(kvarh_cap.get("X2"), 0.0)
+                c3 = _to_float(kvarh_cap.get("X3"), 0.0)
+
+                conn.execute(
+                    text("""
+                        INSERT INTO telemetry_intervals (
+                            meter_id, channel, ts_from, ts_to,
+                            kwh_import, kwh_export,
+                            kvarh_ind_x1, kvarh_ind_x2, kvarh_ind_x3,
+                            kvarh_cap_x1, kvarh_cap_x2, kvarh_cap_x3
+                        )
+                        VALUES (
+                            :meter_id, :channel, :ts_from, :ts_to,
+                            :kwh_import, :kwh_export,
+                            :i1, :i2, :i3,
+                            :c1, :c2, :c3
+                        )
+                        ON CONFLICT (meter_id, channel, ts_from, ts_to)
+                        DO UPDATE SET
+                            kwh_import   = EXCLUDED.kwh_import,
+                            kwh_export   = EXCLUDED.kwh_export,
+                            kvarh_ind_x1 = EXCLUDED.kvarh_ind_x1,
+                            kvarh_ind_x2 = EXCLUDED.kvarh_ind_x2,
+                            kvarh_ind_x3 = EXCLUDED.kvarh_ind_x3,
+                            kvarh_cap_x1 = EXCLUDED.kvarh_cap_x1,
+                            kvarh_cap_x2 = EXCLUDED.kvarh_cap_x2,
+                            kvarh_cap_x3 = EXCLUDED.kvarh_cap_x3
+                    """),
+                    {
+                        "meter_id": payload.device_id,
+                        "channel": channel,
+                        "ts_from": payload.ts_from,
+                        "ts_to": payload.ts_to,
+                        "kwh_import": kwh_import,
+                        "kwh_export": kwh_export,
+                        "i1": i1, "i2": i2, "i3": i3,
+                        "c1": c1, "c2": c2, "c3": c3,
+                    }
+                )
+
+                # ---------- instantáneos ----------
+                inst = v.instant or {}
+                if inst:
+                    inst_clean = _sanitize_jsonable(inst)
+                    inst_json = json.dumps(inst_clean, ensure_ascii=False)
+
+                    conn.execute(
+                        text("""
+                            INSERT INTO telemetry_instants (meter_id, channel, ts, data)
+                            VALUES (:meter_id, :channel, :ts, (:data)::jsonb)
+                            ON CONFLICT (meter_id, channel, ts)
+                            DO UPDATE SET data = EXCLUDED.data
+                        """),
+                        {"meter_id": payload.device_id, "channel": channel, "ts": payload.ts_to, "data": inst_json}
+                    )
+
+        return {"ok": True}
+
+    except Exception as e:
+        print("!!! ERROR in /api/energy:", repr(e))
+        traceback.print_exc()
+        raise
+
+# =========================
+# API FOR DASHBOARD
+# =========================
+
+@app.get("/api/meters", dependencies=[Depends(require_key)])
+def api_meters() -> List[str]:
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT id FROM meters ORDER BY id ASC")).fetchall()
+        return [r[0] for r in rows]
+
+
+@app.get("/api/latest_interval", dependencies=[Depends(require_key)])
+def api_latest_interval(meter_id: str = Query(...)):
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT DISTINCT ON (channel)
+                channel, ts_from, ts_to,
+                kwh_import, kwh_export,
+                kvarh_ind_x1, kvarh_ind_x2, kvarh_ind_x3,
+                kvarh_cap_x1, kvarh_cap_x2, kvarh_cap_x3
+            FROM telemetry_intervals
+            WHERE meter_id = :m
+            ORDER BY channel, ts_to DESC
+        """), {"m": meter_id}).fetchall()
+
+        out = []
+        for r in rows:
+            out.append({
+                "channel": r[0],
+                "ts_from": int(r[1]) if r[1] is not None else None,
+                "ts_to": int(r[2]) if r[2] is not None else None,
+                "kwh_import": float(r[3] or 0.0),
+                "kwh_export": float(r[4] or 0.0),
+                "kvarh_ind": {"X1": float(r[5] or 0.0), "X2": float(r[6] or 0.0), "X3": float(r[7] or 0.0)},
+                "kvarh_cap": {"X1": float(r[8] or 0.0), "X2": float(r[9] or 0.0), "X3": float(r[10] or 0.0)},
+            })
+        return {"meter_id": meter_id, "rows": out, "server_ts": int(time.time())}
+
+
+@app.get("/api/totals_interval", dependencies=[Depends(require_key)])
+def api_totals_interval(meter_id: str = Query(...), period: str = Query("day")):
+    if period not in ("day", "month"):
+        raise HTTPException(status_code=400, detail="period must be 'day' or 'month'")
+
+    start_ts, end_ts = _period_bounds_utc(period)
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                channel,
+                MIN(ts_from) AS ts_from,
+                MAX(ts_to)   AS ts_to,
+                COALESCE(SUM(kwh_import),0) AS kwh_import,
+                COALESCE(SUM(kwh_export),0) AS kwh_export,
+                COALESCE(SUM(kvarh_ind_x1),0) AS kvarh_ind_x1,
+                COALESCE(SUM(kvarh_ind_x2),0) AS kvarh_ind_x2,
+                COALESCE(SUM(kvarh_ind_x3),0) AS kvarh_ind_x3,
+                COALESCE(SUM(kvarh_cap_x1),0) AS kvarh_cap_x1,
+                COALESCE(SUM(kvarh_cap_x2),0) AS kvarh_cap_x2,
+                COALESCE(SUM(kvarh_cap_x3),0) AS kvarh_cap_x3
+            FROM telemetry_intervals
+            WHERE meter_id = :m
+              AND ts_from >= :start_ts
+              AND ts_from <  :end_ts
+            GROUP BY channel
+            ORDER BY channel ASC
+        """), {"m": meter_id, "start_ts": start_ts, "end_ts": end_ts}).fetchall()
+
+        out = []
+        for r in rows:
+            out.append({
+                "channel": r[0],
+                "ts_from": int(r[1]) if r[1] is not None else start_ts,
+                "ts_to": int(r[2]) if r[2] is not None else end_ts,
+                "kwh_import": float(r[3] or 0.0),
+                "kwh_export": float(r[4] or 0.0),
+                "kvarh_ind": {"X1": float(r[5] or 0.0), "X2": float(r[6] or 0.0), "X3": float(r[7] or 0.0)},
+                "kvarh_cap": {"X1": float(r[8] or 0.0), "X2": float(r[9] or 0.0), "X3": float(r[10] or 0.0)},
+            })
+
+        return {"meter_id": meter_id, "period": period, "start_ts": start_ts, "end_ts": end_ts, "rows": out, "server_ts": int(time.time())}
+
+
+@app.get("/api/latest_instant", dependencies=[Depends(require_key)])
+def api_latest_instant(meter_id: str = Query(...), channel: str = Query("T")):
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT ts, data
+            FROM telemetry_instants
+            WHERE meter_id = :m AND channel = :c
+            ORDER BY ts DESC
+            LIMIT 1
+        """), {"m": meter_id, "c": channel}).fetchone()
+
+        if not row:
+            return {"meter_id": meter_id, "channel": channel, "ts": None, "data": None}
+
+        ts = int(row[0])
+        data = row[1] or {}
+
+        try:
+            p = data.get("active_power_w")
+            pf = data.get("power_factor")
+            data = dict(data)
+            data["reactive_power_var"] = _compute_kvar_from_p_pf(p, pf)
+        except Exception:
+            data = dict(data) if isinstance(data, dict) else {}
+            data["reactive_power_var"] = 0.0
+
+        return {"meter_id": meter_id, "channel": channel, "ts": ts, "data": data}
+
+
+@app.get("/api/series_interval", dependencies=[Depends(require_key)])
+def api_series_interval(
+    meter_id: str = Query(...),
+    channel: str = Query("T"),
+    minutes: int = Query(60, ge=1, le=24 * 60),
+    limit: int = Query(2000, ge=1, le=10000),
+):
+    ts_min = int(time.time()) - minutes * 60
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT ts_to, kwh_import, kwh_export
+            FROM telemetry_intervals
+            WHERE meter_id = :m AND channel = :c AND ts_to >= :ts_min
+            ORDER BY ts_to ASC
+            LIMIT :lim
+        """), {"m": meter_id, "c": channel, "ts_min": ts_min, "lim": limit}).fetchall()
+
+        pts = [{"ts": int(r[0]), "kwh_import": float(r[1] or 0.0), "kwh_export": float(r[2] or 0.0)} for r in rows]
+        return {"meter_id": meter_id, "channel": channel, "points": pts}
+
+
+@app.get("/api/series_instant", dependencies=[Depends(require_key)])
+def api_series_instant(
+    meter_id: str = Query(...),
+    channel: str = Query("T"),
+    minutes: int = Query(60, ge=1, le=24 * 60),
+    key: str = Query("active_power_w"),
+    limit: int = Query(2000, ge=1, le=10000),
+):
+    ts_min = int(time.time()) - minutes * 60
+
+    with engine.begin() as conn:
+        if key == "reactive_power_var":
+            rows = conn.execute(text("""
+                SELECT ts,
+                       (data ->> 'active_power_w') AS p,
+                       (data ->> 'power_factor')   AS pf
+                FROM telemetry_instants
+                WHERE meter_id = :m AND channel = :c AND ts >= :ts_min
+                ORDER BY ts ASC
+                LIMIT :lim
+            """), {"m": meter_id, "c": channel, "ts_min": ts_min, "lim": limit}).fetchall()
+
+            pts = []
+            for r in rows:
+                try:
+                    p = float(r[1]) if r[1] is not None else 0.0
+                except Exception:
+                    p = 0.0
+                try:
+                    pf = float(r[2]) if r[2] is not None else 0.0
+                except Exception:
+                    pf = 0.0
+                val = _compute_kvar_from_p_pf(p, pf)
+                pts.append({"ts": int(r[0]), "value": float(val)})
+
+            return {"meter_id": meter_id, "channel": channel, "key": key, "points": pts}
+
+        rows = conn.execute(text("""
+            SELECT ts, (data ->> :k) AS v
+            FROM telemetry_instants
+            WHERE meter_id = :m AND channel = :c AND ts >= :ts_min
+            ORDER BY ts ASC
+            LIMIT :lim
+        """), {"m": meter_id, "c": channel, "ts_min": ts_min, "lim": limit, "k": key}).fetchall()
+
+        pts = []
+        for r in rows:
+            val_raw = r[1]
+            try:
+                val = float(val_raw) if val_raw is not None else None
+            except Exception:
+                val = None
+            pts.append({"ts": int(r[0]), "value": val})
+
+        return {"meter_id": meter_id, "channel": channel, "key": key, "points": pts}
+
+# =========================
+# SIMPLE DASHBOARD (HTML)
+# =========================
+
+@app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(require_key)])
+def dashboard():
+    return HTMLResponse("<h1>OK</h1><p>Dashboard HTML aquí (tu versión larga) </p>")
+
+# =========================
+# OPTIONAL: PURGE HELPERS
+# =========================
+
+@app.post("/api/admin/purge", dependencies=[Depends(require_key)])
+def purge(
+    meter_id: Optional[str] = Query(default=None),
+    keep_days: int = Query(default=7, ge=0, le=3650),
+):
+    cutoff = int(time.time()) - keep_days * 86400 if keep_days > 0 else None
+
+    with engine.begin() as conn:
+        if meter_id:
+            if cutoff is None:
+                conn.execute(text("DELETE FROM telemetry_instants WHERE meter_id=:m"), {"m": meter_id})
+                conn.execute(text("DELETE FROM telemetry_intervals WHERE meter_id=:m"), {"m": meter_id})
+            else:
+                conn.execute(text("DELETE FROM telemetry_instants WHERE meter_id=:m AND ts < :c"), {"m": meter_id, "c": cutoff})
+                conn.execute(text("DELETE FROM telemetry_intervals WHERE meter_id=:m AND ts_to < :c"), {"m": meter_id, "c": cutoff})
+        else:
+            if cutoff is None:
+                conn.execute(text("DELETE FROM telemetry_instants"))
+                conn.execute(text("DELETE FROM telemetry_intervals"))
+            else:
+                conn.execute(text("DELETE FROM telemetry_instants WHERE ts < :c"), {"c": cutoff})
+                conn.execute(text("DELETE FROM telemetry_intervals WHERE ts_to < :c"), {"c": cutoff})
+
+    return {"ok": True, "meter_id": meter_id, "keep_days": keep_days, "cutoff": cutoff}
